@@ -1,0 +1,10 @@
+Console application supported next parameters:
+--help - run information about parameters
+--debug - run with debug log
+--json filename.json - json file for convertation (default frame.json)
+--port 5001 - TCP server port (5001 default)
+--serial portname - name of serial port (default PassiveMatrix)
+
+
+Exammple:
+./Matrix --serial ttyACM0
