@@ -21,20 +21,20 @@
 
 ![image](https://user-images.githubusercontent.com/49637543/150493004-e782d3fd-98be-495a-9174-1d44be5a9455.png)
 
-9.	Now you can use the board with SensorMatrixLAB (https://www.innovationlab.de/de/leistungen/software-download/) or free unix console client https://github.com/InnovationLabGmbH/InnovationLab-ILDevkitV2-Modular/tree/main/ConsoleClient.
+9.	Now you can use the board with <a href="https://www.innovationlab.de/de/leistungen/software-download/">SensorMatrixLAB</a> or <a href="https://github.com/InnovationLabGmbH/InnovationLab-ILDevkitV2-Modular/tree/main/ConsoleClient">free unix console client</a>.
 
 ## How to connect with console client
 Console application supports following parameters:
 
---help - run information about parameters
+`--help` - run information about parameters
 
---debug - run with debug log
+`--debug` - run with debug log
 
---json filename.json - json file for frame conversion, in case you have none-standart matrix. Default: frame.json
+`--json filename.json` - json file for frame conversion, in case you have none-standart matrix. Default: frame.json
 
---port 5001 - TCP server port, access local host to get data in JSON format. Default: 5001
+`--port 5001` - TCP server port, access local host to get data in JSON format. Default: 5001
 
---serial portname - name of serial port. Default: PassiveMatrix
+`--serial portname` - name of serial port. Default: PassiveMatrix
 
 
 Example (run in Ubuntu terminal):
