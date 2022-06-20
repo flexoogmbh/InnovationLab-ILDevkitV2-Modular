@@ -1,5 +1,8 @@
 #include "Application.h"
+#include "modbuscrc.h"
 #include "Serial.h"
+
+#pragma optimize( "", off )
 
 ScanSettings::ScanSettings()
 {
@@ -18,6 +21,13 @@ void ScanSettings::reset()
   m_frameRate = 0;
   m_adcDelay = 0;
   m_refferenceVoltage = 0;
+  m_filterType = FILTER_NONE;
+  m_movAvrWindowSize = 5;
+  m_movAverCumulativeFiltrationCoef = 0.05;
+  m_movAverWeightedWindowSize = 5;
+  m_medianWindowSize = 5;
+  m_kalmanErrMeasure = 0.05;
+  m_kalmanMeasureSpeed = 40;
 }
 
 Command::Command()
@@ -109,6 +119,7 @@ volatile bool Application::scan()
   bool l_result = true;
   uint32_t l_pointsNumber = m_scanSettings.m_xSize * m_scanSettings.m_ySize;
   DATA_TYPE *l_pADCSamples = nullptr;
+  uint32_t l_scanCounter = 0;
   uint32_t l_packageId = 0;
   unsigned long l_timestamp = 0;
   bool l_blink = false;
@@ -148,6 +159,33 @@ volatile bool Application::scan()
   m_pMuxDriveLines->enable();
   m_pMuxDriveLines->reset();
 
+  switch (m_scanSettings.m_filterType) {
+      case FILTER_NONE:
+          m_pFilter = Filter::ByPass::getInstance();
+          m_filterWindowSize = 0;
+          break;
+      case FILTER_MOV_AVERAGE:
+          m_pFilter = Filter::MovAverage::getInstance(m_scanSettings.m_xSize* m_scanSettings.m_ySize, m_scanSettings.m_movAvrWindowSize);
+          m_filterWindowSize = m_scanSettings.m_movAvrWindowSize;
+          break;
+      case FILTER_MEDIAN:
+          m_pFilter = Filter::MedianFilter::getInstance(m_scanSettings.m_xSize * m_scanSettings.m_ySize, m_scanSettings.m_medianWindowSize);
+          m_filterWindowSize = m_scanSettings.m_medianWindowSize;
+          break;
+      case FILTER_MOV_AVERAGE_CUMULATIVE:
+          m_pFilter = Filter::MovAverageCumulative::getInstance(m_scanSettings.m_xSize * m_scanSettings.m_ySize, ((float)m_scanSettings.m_movAverCumulativeFiltrationCoef / 100));
+          m_filterWindowSize = 5;
+          break;
+      case FILTER_MOV_AVERAGE_WEIGHTED:
+          m_pFilter = Filter::MovAverageWeighted::getInstance(m_scanSettings.m_xSize * m_scanSettings.m_ySize, m_scanSettings.m_movAverWeightedWindowSize);
+          m_filterWindowSize = m_scanSettings.m_movAverWeightedWindowSize;
+          break;
+      case FILTER_KALMAN:
+          m_pFilter = Filter::KalmanFilter::getInstance(m_scanSettings.m_xSize * m_scanSettings.m_ySize, ((float)m_scanSettings.m_kalmanMeasureSpeed / 100), (float) m_scanSettings.m_kalmanErrMeasure);
+          m_filterWindowSize = 5;
+          break;
+      }
+
   l_timestamp = millis();
   //Scan loop
   while (m_scanning)
@@ -183,15 +221,36 @@ volatile bool Application::scan()
       m_pMuxDriveLines->nextChnlA(); // Shitf 1 to the next bit (selecting the next column)
     }
 
-    sendFrame(l_pADCSamples, l_pointsNumber, l_packageId, (millis() - l_timestamp), m_UnixTime);
-    ++l_packageId;
+    //Filter data
+    if (!m_pFilter->insertData(l_pADCSamples)) {
+        l_result = false;
+        goto exit;
+    }
+
+    if (l_scanCounter >= m_filterWindowSize) {
+        if (!m_pFilter->getData(l_pADCSamples)) {
+            l_result = false;
+            goto exit;
+        }
+        
+        sendFrame(l_pADCSamples, l_pointsNumber, l_packageId, (millis() - l_timestamp), m_UnixTime);
+        ++l_packageId;
+    }
+    else {
+        ++l_scanCounter;
+    }
     
-    if (l_packageId == m_scanSettings.m_samplesNumber) {
+    if ((m_scanSettings.m_samplesNumber != 0) && (l_packageId >= m_scanSettings.m_samplesNumber)) {
         break;
     }
     
   }
 exit:
+  //Clean filter
+  if (m_pFilter != nullptr) {
+      m_pFilter->free();
+      m_pFilter = nullptr;
+  }
   //Cleanup memory
   delete[] l_pADCSamples;
   //Disable MUX
@@ -283,7 +342,6 @@ bool Application::checkCommand()
     else
     {
       m_doStop = true;
-
       pushHeaderToAnswer();
       pushToAnswer(0);
       pushToAnswer(COMM_ID_START_NO_PARAMS);
@@ -383,6 +441,7 @@ bool Application::checkCommand()
       m_scanning = false;
       break;
   case COMM_ID_WRITE_CONFIG:
+    readSettings();
     // Get received data
 
     m_scanSettings.m_MatrixShiftX = l_command.m_pData[0];
@@ -412,7 +471,9 @@ bool Application::checkCommand()
     {
       m_scanSettings.m_refferenceVoltage = 1;
     }
+
     //15 Filter type
+    m_scanSettings.m_filterType = l_command.m_pData[15];
 
     if (writeSettings())
     {
@@ -444,7 +505,7 @@ bool Application::checkCommand()
     pushToAnswer((uint8_t)m_scanSettings.m_refferenceVoltage);        //Reference voltage (low byte)
     pushToAnswer((uint8_t)(m_scanSettings.m_refferenceVoltage >> 8)); //Reference voltage (high byte)
 
-    pushToAnswer((uint8_t)(0)); //Filter type
+    pushToAnswer((uint8_t)(m_scanSettings.m_filterType)); //Filter type
 
     sendAnswer();
     break;
@@ -553,6 +614,46 @@ bool Application::checkCommand()
       sendAnswer();
     }
     break;
+  case COMM_ID_WRITE_FLTR_CONF:
+      readSettings();
+
+      m_scanSettings.m_movAvrWindowSize = l_command.m_pData[0];
+      m_scanSettings.m_movAverCumulativeFiltrationCoef = l_command.m_pData[2];
+      m_scanSettings.m_movAverWeightedWindowSize = l_command.m_pData[4];
+      m_scanSettings.m_medianWindowSize = l_command.m_pData[6];
+      m_scanSettings.m_kalmanMeasureSpeed = l_command.m_pData[8];
+      m_scanSettings.m_kalmanErrMeasure = l_command.m_pData[9];
+
+      if (writeSettings())
+      {
+          pushHeaderToAnswer();
+          pushToAnswer(0);
+          pushToAnswer(COMM_ID_WRITE_FLTR_CONF);
+          sendAnswer();
+      }
+    break;
+  case COMM_ID_READ_FLTR_CONF:
+      readSettings();
+      pushHeaderToAnswer();
+      pushToAnswer(0);
+      pushToAnswer(COMM_ID_READ_FLTR_CONF);
+      pushToAnswer(0);
+      pushToAnswer(m_scanSettings.m_movAvrWindowSize);
+      pushToAnswer(0);
+      pushToAnswer((uint8_t) (m_scanSettings.m_movAverCumulativeFiltrationCoef));
+      pushToAnswer(0);
+      pushToAnswer(m_scanSettings.m_movAverWeightedWindowSize);
+      pushToAnswer(0);
+      pushToAnswer(m_scanSettings.m_medianWindowSize);
+      pushToAnswer(0);
+      pushToAnswer((uint8_t)(m_scanSettings.m_kalmanMeasureSpeed));
+      pushToAnswer((uint8_t) m_scanSettings.m_kalmanErrMeasure);
+      pushToAnswer(0);
+      sendAnswerCRC();
+    break;
+  default:
+
+    break;
   }
 
   return true;
@@ -563,6 +664,7 @@ bool Application::getCommand(Command &l_command)
   bool l_result = true;
   uint8_t *l_pRxData = nullptr;
   int l_dataSize = Serial.available();
+  uint16_t l_crc = 0;
   l_command.reset();
 
   if (l_dataSize == 0)
@@ -667,8 +769,36 @@ bool Application::getCommand(Command &l_command)
       l_result = false;
       goto exit;
     }
-
     l_command.m_code = COMM_ID_START_NO_PARAMS;
+  }
+  else if (m_rxIndex >= 22 && m_pRxBuffer[8] == COMM_ID_WRITE_FLTR_CONF) {
+
+      l_command.m_dataSize = (((uint16_t)m_pRxBuffer[6] << 8) | (uint16_t)m_pRxBuffer[5]);
+
+      if (l_command.m_dataSize != 16) {
+          l_result = false;
+          goto exit;
+      }
+
+      l_crc = mbCrc(&m_pRxBuffer[7], (l_command.m_dataSize - 2));
+
+      if (l_crc != ((((uint16_t)m_pRxBuffer[21]) << 8) | ((uint16_t)m_pRxBuffer[22]))) {
+          l_result = false;
+          goto exit;
+      }
+
+      l_command.m_code = COMM_ID_WRITE_FLTR_CONF;
+      l_command.m_pData = &m_pRxBuffer[10];
+
+  }
+  else if (m_rxIndex >= 9 && m_pRxBuffer[8] == COMM_ID_READ_FLTR_CONF) {
+      l_command.m_dataSize = (((uint16_t)m_pRxBuffer[6] << 8) | (uint16_t)m_pRxBuffer[5]);
+      if (l_command.m_dataSize != 2) {
+          l_result = false;
+          goto exit;
+      }
+
+      l_command.m_code = COMM_ID_READ_FLTR_CONF;
   }
 
 exit:
@@ -693,6 +823,30 @@ bool Application::writeSettings()
 bool Application::readSettings()
 {
   ret_code_t l_result = myFlashPrefs.readPrefs(&m_scanSettings, sizeof(m_scanSettings));
+
+  if (m_scanSettings.m_movAvrWindowSize >= MOV_AVERAGE_MAX_WINDOW_SIZE) {
+      m_scanSettings.m_movAvrWindowSize = MOV_AVERAGE_MAX_WINDOW_SIZE;
+  }
+
+  if (m_scanSettings.m_movAverCumulativeFiltrationCoef >= MOV_AVERAGE_CUMMULATIVE_MAX_COEF) {
+      m_scanSettings.m_movAverCumulativeFiltrationCoef = MOV_AVERAGE_CUMMULATIVE_MAX_COEF;
+  }
+
+  if (m_scanSettings.m_movAverWeightedWindowSize >= MOV_AVERAGE_WEIGHTED_MAX_WINDOW_SIZE) {
+      m_scanSettings.m_movAverWeightedWindowSize = MOV_AVERAGE_WEIGHTED_MAX_WINDOW_SIZE;
+  }
+
+  if (m_scanSettings.m_medianWindowSize >= MEDIAN_MAX_WINDOW_SIZE) {
+      m_scanSettings.m_medianWindowSize = MEDIAN_MAX_WINDOW_SIZE;
+  }
+
+  if (m_scanSettings.m_kalmanErrMeasure >= KALMAN_MAX_ERROR) {
+      m_scanSettings.m_kalmanErrMeasure = KALMAN_MAX_ERROR;
+  }
+
+  if (m_scanSettings.m_kalmanMeasureSpeed >= KALMAN_MAX_SPEED) {
+      m_scanSettings.m_kalmanMeasureSpeed = KALMAN_MAX_SPEED;
+  }
 
   return (l_result == FDS_SUCCESS);
 }
@@ -791,6 +945,32 @@ bool Application::sendAnswer()
   {
     return false;
   }
+}
+
+bool Application::sendAnswerCRC()
+{
+    size_t l_txLength = 0;
+    uint16_t l_crc = 0;
+
+    l_crc = mbCrc(&m_pTxBuffer[7], (m_txLength - 7));
+
+    pushToAnswer((uint8_t)((l_crc >> 8) & 0xFF));
+    pushToAnswer((uint8_t)((l_crc >> 0) & 0xFF));
+
+    m_pTxBuffer[5] = (uint8_t)(m_txLength - 7);        //Data length
+    m_pTxBuffer[6] = (uint8_t)((m_txLength - 7) >> 8); //Data length
+
+    l_txLength = Serial.write(m_pTxBuffer, m_txLength);
+
+    if (l_txLength == m_txLength)
+    {
+        resetAnswer();
+        return true;
+    }
+    else
+    {
+        return false;
+    }
 }
 
 bool Application::setReferenceVoltage(uint16_t l_dacVoltage)
